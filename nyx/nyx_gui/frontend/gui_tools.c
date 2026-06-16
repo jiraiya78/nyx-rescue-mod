@@ -33,6 +33,11 @@
 #include <libs/compr/blz.h>
 #include <libs/fatfs/ff.h>
 
+#define MINIZ_NO_ZLIB_COMPATIBLE_NAMES
+#define MINIZ_NO_STDIO
+#define MINIZ_NO_TIME
+#include <libs/miniz/miniz.c>
+
 lv_obj_t *ums_mbox;
 
 extern char *emmcsn_path_impl(char *path, char *sub_dir, char *filename, sdmmc_storage_t *storage);
@@ -1853,9 +1858,13 @@ static lv_res_t _run_system_rescue_action(lv_obj_t *btn)
 	// Start building our text report string
 	strcat(summary_buffer, "#FF8000 System Rescue Complete!#\n\n");
 
+
 	FILINFO fno;
 	int total_items = sizeof(target_folders) / sizeof(target_folders[0]);
 
+	if (sd_mount())
+	{
+		
 	// 2. Scan the SD Card filesystem using FatFS
 	for (int i = 0; i < total_items; i++)
 	{
@@ -1895,6 +1904,9 @@ static lv_res_t _run_system_rescue_action(lv_obj_t *btn)
 	{
 		strcat(summary_buffer, "\n\n#FFFF00 Safe to reboot!# Your Atmosphere boot chain components are clear.");
 	}
+	} //end sd_mount
+	
+	sd_unmount();
 
 	// 5. Render the result window onto the screen
 	lv_obj_t *dark_bg = lv_obj_create(lv_scr_act(), NULL);
@@ -1926,6 +1938,8 @@ static lv_res_t _run_tier2_advanced_action(lv_obj_t *btn)
 	FILINFO fno;
 	int changes = 0;
 
+	if (sd_mount())
+	{
 	// 1. Purge problematic reboot payload that causes infinite warmboot crash loops
 	if (f_stat("atmosphere/reboot_payload.bin", &fno) == FR_OK)
 	{
@@ -1963,7 +1977,9 @@ static lv_res_t _run_tier2_advanced_action(lv_obj_t *btn)
 	{
 		strcat(summary_buffer, "\n#FFFF00 Notice:# System settings reset to safe default fallback values.");
 	}
-
+	}
+	sd_unmount();
+	
 	// Render Status Box Window
 	lv_obj_t *dark_bg = lv_obj_create(lv_scr_act(), NULL);
 	lv_obj_set_style(dark_bg, &mbox_darken);
@@ -2014,271 +2030,50 @@ static void _zip_mkdir_p(const char *path)
 	char tmp[FF_MAX_LFN];
 	strncpy(tmp, path, sizeof(tmp) - 1);
 	tmp[sizeof(tmp) - 1] = '\0';
-	for (char *p = tmp + 1; *p; p++)
+
+	// Strip trailing slash if present (directory entries).
+	size_t len = strlen(tmp);
+	if (len > 0 && tmp[len - 1] == '/')
 	{
-		if (*p == '/')
+		tmp[len - 1] = '\0';
+		// For directory entries, create all components including the final one.
+		for (char *p = tmp + 1; *p; p++)
 		{
-			*p = '\0';
-			f_mkdir(tmp); // Ignore errors — dir may already exist.
-			*p = '/';
+			if (*p == '/')
+			{
+				*p = '\0';
+				f_mkdir(tmp);
+				*p = '/';
+			}
 		}
+		f_mkdir(tmp); // Create the final directory component.
+	}
+	else
+	{
+		// For file paths, only create parent directories — NOT the final component.
+		for (char *p = tmp + 1; *p; p++)
+		{
+			if (*p == '/')
+			{
+				*p = '\0';
+				f_mkdir(tmp);
+				*p = '/';
+			}
+		}
+		// Do NOT call f_mkdir(tmp) here — tmp is a file, not a directory.
 	}
 }
 
-// Minimal DEFLATE inflater (tinfl, public domain by Rich Geldreich).
-// Stripped to the minimum needed for ZIP files (no zlib header).
-#define TINFL_MAX_HUFF_TABLES 3
-#define TINFL_MAX_HUFF_SYMBOLS_0 288
-#define TINFL_MAX_HUFF_SYMBOLS_1 32
-#define TINFL_MAX_HUFF_SYMBOLS_2 19
-#define TINFL_FAST_LOOKUP_BITS 10
-#define TINFL_FAST_LOOKUP_SIZE (1 << TINFL_FAST_LOOKUP_BITS)
-
-typedef struct {
-	u8  code_size[TINFL_MAX_HUFF_SYMBOLS_0];
-	s16 look_up[TINFL_FAST_LOOKUP_SIZE];
-	s16 tree[TINFL_MAX_HUFF_SYMBOLS_0 * 2];
-} tinfl_huff_table_t;
-
-typedef struct {
-	tinfl_huff_table_t tables[TINFL_MAX_HUFF_TABLES];
-	u32 bit_buf;
-	int num_bits;
-	u32 dist, counter, num_extra;
-	int block_type;
-	u32 check_adler32;
-	int final_block;
-} tinfl_state_t;
 
 // Returns decompressed size on success, -1 on error.
 // in_buf/in_size: compressed DEFLATE stream (raw, no zlib header).
 // out_buf must be pre-allocated to out_size bytes.
 static int _tinfl_decompress(const u8 *in_buf, u32 in_size, u8 *out_buf, u32 out_size)
 {
-	// Static Huffman lengths for fixed block type.
-	static const u8 s_length_extra[31] = {0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0,0,0};
-	static const u32 s_length_base[31] = {3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258,0,0};
-	static const u8 s_dist_extra[30]   = {0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13};
-	static const u32 s_dist_base[32]   = {1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577,0,0};
-	static const u8 s_length_dezigzag[19] = {16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15};
-
-	const u8 *in_p = in_buf, *in_end = in_buf + in_size;
-	u8 *out_p = out_buf, *out_end = out_buf + out_size;
-	u32 bit_buf = 0;
-	int num_bits = 0;
-
-#define TINFL_GET_BITS(n, v) do { \
-	while (num_bits < (int)(n)) { \
-		if (in_p >= in_end) return -1; \
-		bit_buf |= ((u32)*in_p++) << num_bits; num_bits += 8; } \
-	(v) = bit_buf & ((1u << (n)) - 1); bit_buf >>= (n); num_bits -= (n); } while (0)
-
-	int final = 0;
-	while (!final)
-	{
-		int bfinal, btype;
-		TINFL_GET_BITS(1, bfinal); final = bfinal;
-		TINFL_GET_BITS(2, btype);
-
-		if (btype == 0) // Stored block.
-		{
-			// Align to byte boundary.
-			bit_buf = 0; num_bits = 0;
-			if (in_p + 4 > in_end) return -1;
-			u32 len = in_p[0] | ((u32)in_p[1] << 8);
-			in_p += 4;
-			if (in_p + len > in_end || out_p + len > out_end) return -1;
-			memcpy(out_p, in_p, len);
-			out_p += len; in_p += len;
-		}
-		else if (btype == 1 || btype == 2)
-		{
-			u8 code_sizes_ll[TINFL_MAX_HUFF_SYMBOLS_0];
-			u8 code_sizes_d[TINFL_MAX_HUFF_SYMBOLS_1];
-			u8 code_sizes_cl[TINFL_MAX_HUFF_SYMBOLS_2];
-			s16 ll_lookup[TINFL_FAST_LOOKUP_SIZE], d_lookup[TINFL_FAST_LOOKUP_SIZE];
-			s16 ll_tree[TINFL_MAX_HUFF_SYMBOLS_0 * 2], d_tree[TINFL_MAX_HUFF_SYMBOLS_1 * 2];
-			int ll_syms, d_syms;
-
-			if (btype == 1) // Fixed Huffman.
-			{
-				int i;
-				for (i = 0; i <= 143; i++) code_sizes_ll[i] = 8;
-				for (; i <= 255; i++) code_sizes_ll[i] = 9;
-				for (; i <= 279; i++) code_sizes_ll[i] = 7;
-				for (; i <= 287; i++) code_sizes_ll[i] = 8;
-				for (i = 0; i < 32; i++) code_sizes_d[i] = 5;
-				ll_syms = 288; d_syms = 32;
-			}
-			else // Dynamic Huffman.
-			{
-				int hlit, hdist, hclen;
-				TINFL_GET_BITS(5, hlit);  ll_syms = hlit + 257;
-				TINFL_GET_BITS(5, hdist); d_syms  = hdist + 1;
-				TINFL_GET_BITS(4, hclen);
-
-				memset(code_sizes_cl, 0, sizeof(code_sizes_cl));
-				for (int i = 0; i < hclen + 4; i++)
-				{
-					int v; TINFL_GET_BITS(3, v);
-					code_sizes_cl[s_length_dezigzag[i]] = (u8)v;
-				}
-
-				// Build CL table.
-				s16 cl_lookup[TINFL_FAST_LOOKUP_SIZE], cl_tree[TINFL_MAX_HUFF_SYMBOLS_2 * 2];
-				memset(cl_lookup, 0, sizeof(cl_lookup));
-				{ // Build Huffman table inline.
-					u32 next_code[17] = {0};
-					int bl_count[17] = {0};
-					for (int i = 0; i < TINFL_MAX_HUFF_SYMBOLS_2; i++) bl_count[code_sizes_cl[i]]++;
-					bl_count[0] = 0;
-					for (int bits = 1; bits <= 16; bits++)
-						next_code[bits] = (next_code[bits-1] + bl_count[bits-1]) << 1;
-					memset(cl_lookup, -1, sizeof(cl_lookup));
-					int tree_next = -1;
-					for (int sym = 0; sym < TINFL_MAX_HUFF_SYMBOLS_2; sym++)
-					{
-						int len = code_sizes_cl[sym];
-						if (!len) continue;
-						u32 rev_code = 0, code = next_code[len]++;
-						for (int bit = 0; bit < len; bit++) rev_code |= ((code >> bit) & 1) << (len - 1 - bit);
-						if (len <= TINFL_FAST_LOOKUP_BITS)
-						{
-							for (int j = rev_code; j < TINFL_FAST_LOOKUP_SIZE; j += (1 << len))
-								cl_lookup[j] = (s16)((sym << 9) | len);
-						}
-						else
-						{
-							int tree_cur = cl_lookup[rev_code & (TINFL_FAST_LOOKUP_SIZE - 1)];
-							if (tree_cur == -1)
-							{
-								cl_lookup[rev_code & (TINFL_FAST_LOOKUP_SIZE - 1)] = (s16)(tree_next * 2);
-								tree_cur = tree_next * 2; tree_next--;
-							}
-							for (int bit = TINFL_FAST_LOOKUP_BITS; bit < len; bit++, tree_cur -= ((rev_code >> bit) & 1) ? 0 : 1)
-							{
-								if (!cl_tree[-tree_cur - 1])
-								{
-									cl_tree[-tree_cur - 1] = (s16)(tree_next * 2);
-									tree_next--;
-								}
-								tree_cur = cl_tree[-tree_cur - 1];
-							}
-							cl_tree[-tree_cur - 1] = (s16)sym;
-						}
-					}
-				}
-
-				// Decode LL and D code lengths using CL table.
-				u8 *dst_sizes[2] = { code_sizes_ll, code_sizes_d };
-				int dst_counts[2] = { ll_syms, d_syms };
-				for (int pass = 0; pass < 2; pass++)
-				{
-					int decoded = 0;
-					while (decoded < dst_counts[pass])
-					{
-						// Decode symbol from CL table.
-						int tree_cur, sym;
-						while (num_bits < TINFL_FAST_LOOKUP_BITS)
-						{
-							if (in_p < in_end) { bit_buf |= ((u32)*in_p++) << num_bits; num_bits += 8; }
-							else break;
-						}
-						tree_cur = cl_lookup[bit_buf & (TINFL_FAST_LOOKUP_SIZE - 1)];
-						if (tree_cur >= 0) { sym = tree_cur >> 9; num_bits -= tree_cur & 511; bit_buf >>= tree_cur & 511; }
-						else { int code_len = TINFL_FAST_LOOKUP_BITS; tree_cur = ~(tree_cur >> 1);
-							   do { tree_cur = cl_tree[tree_cur * 2 + ((bit_buf >> code_len++) & 1)]; } while (tree_cur < 0);
-							   sym = tree_cur; num_bits -= code_len; bit_buf >>= code_len; }
-
-						if (sym < 16) { dst_sizes[pass][decoded++] = (u8)sym; }
-						else {
-							int rep, rep_val = 0;
-							if (sym == 16)      { int v; TINFL_GET_BITS(2, v); rep = v + 3; rep_val = decoded ? dst_sizes[pass][decoded-1] : 0; }
-							else if (sym == 17) { int v; TINFL_GET_BITS(3, v); rep = v + 3; }
-							else                { int v; TINFL_GET_BITS(7, v); rep = v + 11; }
-							while (rep-- && decoded < dst_counts[pass]) dst_sizes[pass][decoded++] = (u8)rep_val;
-						}
-					}
-				}
-			}
-
-			// Build LL and D Huffman lookup tables (same pattern as CL above).
-			#define BUILD_TABLE(lookup, tree, syms, sizes, lookup_size, sym_count) do { \
-				u32 next_code[17] = {0}; int bl_count[17] = {0}; \
-				for (int _i = 0; _i < (sym_count); _i++) bl_count[(sizes)[_i]]++; \
-				bl_count[0] = 0; \
-				for (int _b = 1; _b <= 16; _b++) next_code[_b] = (next_code[_b-1] + bl_count[_b-1]) << 1; \
-				memset((lookup), -1, (lookup_size) * sizeof(s16)); \
-				int _tn = -1; \
-				for (int _s = 0; _s < (sym_count); _s++) { int _l = (sizes)[_s]; if (!_l) continue; \
-					u32 _r = 0, _c = next_code[_l]++; \
-					for (int _bit = 0; _bit < _l; _bit++) _r |= ((_c >> _bit) & 1) << (_l - 1 - _bit); \
-					if (_l <= TINFL_FAST_LOOKUP_BITS) { for (int _j = _r; _j < (lookup_size); _j += (1 << _l)) (lookup)[_j] = (s16)((_s << 9) | _l); } \
-					else { int _tc = (lookup)[_r & ((lookup_size)-1)]; \
-						   if (_tc == -1) { (lookup)[_r & ((lookup_size)-1)] = (s16)(_tn * 2); _tc = _tn * 2; _tn--; } \
-						   for (int _bit = TINFL_FAST_LOOKUP_BITS; _bit < _l; _bit++, _tc -= ((_r >> _bit) & 1) ? 0 : 1) { \
-							   if (!(tree)[-_tc-1]) { (tree)[-_tc-1] = (s16)(_tn * 2); _tn--; } _tc = (tree)[-_tc-1]; } \
-						   (tree)[-_tc-1] = (s16)_s; } } } while(0)
-
-			BUILD_TABLE(ll_lookup, ll_tree, TINFL_FAST_LOOKUP_SIZE, code_sizes_ll, TINFL_FAST_LOOKUP_SIZE, ll_syms);
-			BUILD_TABLE(d_lookup,  d_tree,  TINFL_FAST_LOOKUP_SIZE, code_sizes_d,  TINFL_FAST_LOOKUP_SIZE, d_syms);
-
-			// Decode literals/lengths/distances.
-			for (;;)
-			{
-				// Decode LL symbol.
-				while (num_bits < TINFL_FAST_LOOKUP_BITS)
-					if (in_p < in_end) { bit_buf |= ((u32)*in_p++) << num_bits; num_bits += 8; } else break;
-				int tree_cur = ll_lookup[bit_buf & (TINFL_FAST_LOOKUP_SIZE - 1)];
-				int sym;
-				if (tree_cur >= 0) { sym = tree_cur >> 9; num_bits -= tree_cur & 511; bit_buf >>= tree_cur & 511; }
-				else { int code_len = TINFL_FAST_LOOKUP_BITS; tree_cur = ~(tree_cur >> 1);
-					   do { tree_cur = ll_tree[tree_cur * 2 + ((bit_buf >> code_len++) & 1)]; } while (tree_cur < 0);
-					   sym = tree_cur; num_bits -= code_len; bit_buf >>= code_len; }
-
-				if (sym < 256) // Literal.
-				{
-					if (out_p >= out_end) return -1;
-					*out_p++ = (u8)sym;
-				}
-				else if (sym == 256) break; // End of block.
-				else // Length/distance pair.
-				{
-					int length_idx = sym - 257;
-					if (length_idx >= 29) return -1;
-					int length = s_length_base[length_idx];
-					if (s_length_extra[length_idx]) { int v; TINFL_GET_BITS(s_length_extra[length_idx], v); length += v; }
-
-					// Decode distance symbol.
-					while (num_bits < TINFL_FAST_LOOKUP_BITS)
-						if (in_p < in_end) { bit_buf |= ((u32)*in_p++) << num_bits; num_bits += 8; } else break;
-					tree_cur = d_lookup[bit_buf & (TINFL_FAST_LOOKUP_SIZE - 1)];
-					int dist_sym;
-					if (tree_cur >= 0) { dist_sym = tree_cur >> 9; num_bits -= tree_cur & 511; bit_buf >>= tree_cur & 511; }
-					else { int code_len = TINFL_FAST_LOOKUP_BITS; tree_cur = ~(tree_cur >> 1);
-						   do { tree_cur = d_tree[tree_cur * 2 + ((bit_buf >> code_len++) & 1)]; } while (tree_cur < 0);
-						   dist_sym = tree_cur; num_bits -= code_len; bit_buf >>= code_len; }
-
-					if (dist_sym >= 30) return -1;
-					int dist = s_dist_base[dist_sym];
-					if (s_dist_extra[dist_sym]) { int v; TINFL_GET_BITS(s_dist_extra[dist_sym], v); dist += v; }
-
-					u8 *match_src = out_p - dist;
-					if (match_src < out_buf) return -1;
-					if (out_p + length > out_end) return -1;
-					// Copy with overlap support (byte-by-byte when dist < length).
-					for (int k = 0; k < length; k++) out_p[k] = match_src[k];
-					out_p += length;
-				}
-			}
-		}
-		else return -1; // Reserved block type.
-	}
-
-#undef TINFL_GET_BITS
-#undef BUILD_TABLE
-
-	return (int)(out_p - out_buf);
+    size_t result = tinfl_decompress_mem_to_mem(out_buf, (size_t)out_size,
+                                                in_buf,  (size_t)in_size, 0);
+    // 0 flags = raw deflate (no zlib wrapper), which is what ZIP method 8 uses
+    return (result == TINFL_DECOMPRESS_MEM_TO_MEM_FAILED) ? -1 : (int)result;
 }
 
 // Scan ZIP archive in 'zip_buf' for an entry whose filename matches 'fname_prefix'.
@@ -2290,6 +2085,7 @@ static u32 _zip_extract_entry(const u8 *zip_buf, u32 zip_size,
 {
 	const u8 *p = zip_buf;
 	const u8 *end = zip_buf + zip_size;
+	size_t prefix_len = strlen(fname_prefix);
 
 	while (p + sizeof(zip_local_hdr_t) <= end)
 	{
@@ -2302,28 +2098,29 @@ static u32 _zip_extract_entry(const u8 *zip_buf, u32 zip_size,
 		const char *fname = (const char *)(p + sizeof(zip_local_hdr_t));
 		const u8 *data = (const u8 *)(fname + fname_len + extra_len);
 
-		// Check if this entry's name starts with our prefix.
-		bool match = (fname_len >= strlen(fname_prefix)) &&
-		             (memcmp(fname, fname_prefix, strlen(fname_prefix)) == 0);
-
 		u32 comp_size   = hdr->comp_size;
 		u32 uncomp_size = hdr->uncomp_size;
 
-		// Handle data descriptor (flags bit 3): sizes are after the data.
-		if ((hdr->flags & 0x8) && comp_size == 0)
+		// Handle data descriptor flag safely.
+		if ((hdr->flags & 0x8) && comp_size == 0 && uncomp_size == 0)
 		{
-			// Scan forward for data descriptor signature.
-			const u8 *scan = data;
-			while (scan + 16 <= end)
+			p = data;
+			continue;
+		}
+
+		// Match prefix anywhere in the filename path, case-insensitive.
+		// e.g. "hekate_ctcaer_" matches "hekate_ctcaer_6.2.2/hekate_ctcaer_6.2.2.bin"
+		bool match = false;
+		if (fname_len >= prefix_len)
+		{
+			// Check every position in fname for the prefix.
+			for (int i = 0; i <= (int)(fname_len - prefix_len); i++)
 			{
-				u32 sig = scan[0] | ((u32)scan[1]<<8) | ((u32)scan[2]<<16) | ((u32)scan[3]<<24);
-				if (sig == ZIP_DATA_DESC_SIG)
+				if (strncasecmp(fname + i, fname_prefix, prefix_len) == 0)
 				{
-					comp_size   = scan[8]  | ((u32)scan[9]<<8)  | ((u32)scan[10]<<16) | ((u32)scan[11]<<24);
-					uncomp_size = scan[12] | ((u32)scan[13]<<8) | ((u32)scan[14]<<16) | ((u32)scan[15]<<24);
+					match = true;
 					break;
 				}
-				scan++;
 			}
 		}
 
@@ -2340,91 +2137,6 @@ static u32 _zip_extract_entry(const u8 *zip_buf, u32 zip_size,
 			if (!out) return 0;
 
 			int result = -1;
-			if (hdr->method == 0) // Stored.
-			{
-				memcpy(out, data, uncomp_size);
-				result = (int)uncomp_size;
-			}
-			else if (hdr->method == 8) // Deflate.
-			{
-				result = _tinfl_decompress(data, comp_size, out, uncomp_size);
-			}
-
-			if (result < 0) { free(out); return 0; }
-			*out_data = out;
-			return (u32)result;
-		}
-
-		// Skip to next entry.
-		if (data + comp_size > end) break;
-		p = data + comp_size;
-		// Skip optional data descriptor after entry data.
-		if ((hdr->flags & 0x8))
-		{
-			u32 sig = p[0] | ((u32)p[1]<<8) | ((u32)p[2]<<16) | ((u32)p[3]<<24);
-			if (sig == ZIP_DATA_DESC_SIG) p += 16;
-		}
-	}
-	return 0;
-}
-
-// Walk a ZIP archive and extract all entries whose names start with 'path_prefix'
-// to 'dest_root' on the SD card. Skips directory entries (names ending in '/').
-// Returns count of files successfully written, or -1 on fatal error.
-static int _zip_extract_folder(const u8 *zip_buf, u32 zip_size,
-	const char *path_prefix, const char *dest_root, char *log_buf)
-{
-	const u8 *p = zip_buf;
-	const u8 *end = zip_buf + zip_size;
-	int count = 0;
-	size_t prefix_len = strlen(path_prefix);
-
-	while (p + sizeof(zip_local_hdr_t) <= end)
-	{
-		const zip_local_hdr_t *hdr = (const zip_local_hdr_t *)p;
-		if (hdr->sig != ZIP_LOCAL_SIG) break;
-
-		u16 fname_len = hdr->fname_len;
-		u16 extra_len = hdr->extra_len;
-		const char *fname = (const char *)(p + sizeof(zip_local_hdr_t));
-		const u8 *data    = (const u8 *)(fname + fname_len + extra_len);
-
-		u32 comp_size   = hdr->comp_size;
-		u32 uncomp_size = hdr->uncomp_size;
-
-		if ((hdr->flags & 0x8) && comp_size == 0)
-		{
-			const u8 *scan = data;
-			while (scan + 16 <= end)
-			{
-				u32 sig = scan[0]|((u32)scan[1]<<8)|((u32)scan[2]<<16)|((u32)scan[3]<<24);
-				if (sig == ZIP_DATA_DESC_SIG)
-				{
-					comp_size   = scan[8] |((u32)scan[9]<<8) |((u32)scan[10]<<16)|((u32)scan[11]<<24);
-					uncomp_size = scan[12]|((u32)scan[13]<<8)|((u32)scan[14]<<16)|((u32)scan[15]<<24);
-					break;
-				}
-				scan++;
-			}
-		}
-
-		// Check prefix match and skip pure directory entries.
-		bool name_match = (fname_len >= prefix_len &&
-		                   memcmp(fname, path_prefix, prefix_len) == 0);
-		bool is_dir     = (fname[fname_len - 1] == '/');
-
-		if (name_match && !is_dir && uncomp_size > 0)
-		{
-			// Build destination path: dest_root + '/' + fname (strip path_prefix).
-			char out_path[FF_MAX_LFN];
-			const char *rel = fname + prefix_len;
-			snprintf(out_path, sizeof(out_path), "%s/%s", dest_root, rel);
-			_zip_mkdir_p(out_path);
-
-			u8 *out = malloc(uncomp_size);
-			if (!out) return -1;
-
-			int result = -1;
 			if (hdr->method == 0)
 			{
 				memcpy(out, data, uncomp_size);
@@ -2435,37 +2147,178 @@ static int _zip_extract_folder(const u8 *zip_buf, u32 zip_size,
 				result = _tinfl_decompress(data, comp_size, out, uncomp_size);
 			}
 
-			if (result > 0)
+			if (result < 0) { free(out); return 0; }
+			*out_data = out;
+			return (u32)result;
+		}
+
+		// Advance to next entry.
+		if (data + comp_size > end) break;
+		p = data + comp_size;
+
+		// Skip data descriptor if present.
+		if (hdr->flags & 0x8)
+		{
+			if (p + 16 <= end)
 			{
-				FIL fp;
-				UINT written;
-				if (f_open(&fp, out_path, FA_CREATE_ALWAYS | FA_WRITE) == FR_OK)
+				u32 sig = p[0]|((u32)p[1]<<8)|((u32)p[2]<<16)|((u32)p[3]<<24);
+				if (sig == ZIP_DATA_DESC_SIG) p += 16;
+			}
+		}
+	}
+	return 0;
+}
+
+// Walk a ZIP archive and extract all entries whose names start with 'path_prefix'
+// to 'dest_root' on the SD card. Skips directory entries (names ending in '/').
+// Returns count of files successfully written, or -1 on fatal error.
+// Walk a ZIP archive and extract all entries whose names start with 'path_prefix'
+// to the SD card. Directory entries are created. Zero-byte files are created empty.
+// Logs to FIL *log_fp if non-NULL. Returns count of files successfully written.
+static int _zip_extract_folder(const u8 *zip_buf, u32 zip_size,
+	const char *path_prefix, const char *dest_root, FIL *log_fp)
+{
+	const u8 *p = zip_buf;
+	const u8 *end = zip_buf + zip_size;
+	int count = 0;
+	size_t prefix_len = strlen(path_prefix);
+	bool dest_empty = (dest_root == NULL || dest_root[0] == '\0');
+
+	#define ZIP_LOG(fmt, ...) \
+		do { \
+			if (log_fp) { \
+				char _zl[256]; \
+				int _zn = snprintf(_zl, sizeof(_zl), fmt, ##__VA_ARGS__); \
+				UINT _zw; \
+				f_write(log_fp, _zl, _zn, &_zw); \
+			} \
+		} while(0)
+
+	while (p + sizeof(zip_local_hdr_t) <= end)
+	{
+		const zip_local_hdr_t *hdr = (const zip_local_hdr_t *)p;
+		if (hdr->sig != ZIP_LOCAL_SIG) break;
+
+		u16 fname_len = hdr->fname_len;
+		u16 extra_len = hdr->extra_len;
+
+		// Copy fname into null-terminated buffer — not null-terminated in ZIP.
+		char fname[FF_MAX_LFN];
+		u16 safe_len = fname_len < (FF_MAX_LFN - 1) ? fname_len : (FF_MAX_LFN - 1);
+		memcpy(fname, p + sizeof(zip_local_hdr_t), safe_len);
+		fname[safe_len] = '\0';
+
+		const u8 *data  = p + sizeof(zip_local_hdr_t) + fname_len + extra_len;
+		u32 comp_size   = hdr->comp_size;
+		u32 uncomp_size = hdr->uncomp_size;
+
+		// Safe skip when both sizes are truly unknown.
+		if ((hdr->flags & 0x8) && comp_size == 0 && uncomp_size == 0)
+		{
+			ZIP_LOG("SKIP (data descriptor): %s\n", fname);
+			p = data;
+			continue;
+		}
+
+		bool is_dir     = (safe_len > 0 && fname[safe_len - 1] == '/');
+		bool name_match = (safe_len >= prefix_len &&
+		                   strncasecmp(fname, path_prefix, prefix_len) == 0);
+
+		ZIP_LOG("%s [m=%d cs=%lu us=%lu elen=%u]: %s\n",
+			name_match ? ">" : " ",
+			hdr->method, (unsigned long)comp_size,
+			(unsigned long)uncomp_size, (unsigned int)extra_len, fname);
+
+		if (name_match)
+		{
+			// Keep full fname path when no dest_root given.
+			char out_path[FF_MAX_LFN];
+			if (dest_empty)
+				snprintf(out_path, sizeof(out_path), "%s", fname);
+			else
+				snprintf(out_path, sizeof(out_path), "%s/%s", dest_root, fname);
+
+			if (is_dir)
+			{
+				_zip_mkdir_p(out_path); // handles trailing slash internally
+				ZIP_LOG("  MKDIR: %s\n", out_path);
+			}
+			else
+			{
+				_zip_mkdir_p(out_path); // creates parent dirs only
+
+				if (uncomp_size == 0)
 				{
-					f_write(&fp, out, (UINT)result, &written);
-					f_close(&fp);
-					count++;
+					// Zero-byte file (e.g. boot2.flag) — create empty.
+					FIL fp; UINT bw;
+					if (f_open(&fp, out_path, FA_CREATE_ALWAYS | FA_WRITE) == FR_OK)
+					{
+						f_close(&fp);
+						count++;
+						ZIP_LOG("  TOUCH: %s\n", out_path);
+					}
+					else
+						ZIP_LOG("#FF0000 WRITE FAIL (empty): %s#\n", out_path);
 				}
-				else if (log_buf)
+				else
 				{
-					strcat(log_buf, "#FFFF00 WARN: Could not write ");
-					// Append just the rel path, guarded against overflow.
-					int ll = strlen(log_buf);
-					int rl = strlen(rel);
-					if (ll + rl + 4 < 2048)
-					{ memcpy(log_buf + ll, rel, rl); log_buf[ll + rl] = '\n'; log_buf[ll + rl + 1] = '\0'; }
+					u8 *out = malloc(uncomp_size);
+					if (!out)
+					{
+						ZIP_LOG("#FF0000 NOMEM: %s#\n", out_path);
+						if (data + comp_size > end) break;
+						p = data + comp_size;
+						continue;
+					}
+
+					int result = -1;
+					if (hdr->method == 0)
+					{
+						memcpy(out, data, uncomp_size);
+						result = (int)uncomp_size;
+					}
+					else if (hdr->method == 8)
+					{
+						result = _tinfl_decompress(data, comp_size, out, uncomp_size);
+					}
+					else
+						ZIP_LOG("#FFFF00 UNSUPPORTED method %d: %s#\n", hdr->method, out_path);
+
+					if (result > 0)
+					{
+						FIL fp; UINT written;
+						if (f_open(&fp, out_path, FA_CREATE_ALWAYS | FA_WRITE) == FR_OK)
+						{
+							f_write(&fp, out, (UINT)result, &written);
+							f_close(&fp);
+							count++;
+							ZIP_LOG("#00FF00 OK: %s (%d bytes)#\n", out_path, result);
+						}
+						else
+							ZIP_LOG("#FF0000 WRITE FAIL: %s#\n", out_path);
+					}
+					else if (result < 0)
+						ZIP_LOG("#FF0000 DECOMP FAIL: %s#\n", out_path);
+
+					free(out);
 				}
 			}
-			free(out);
 		}
 
 		if (data + comp_size > end) break;
 		p = data + comp_size;
+
 		if (hdr->flags & 0x8)
 		{
-			u32 sig = p[0]|((u32)p[1]<<8)|((u32)p[2]<<16)|((u32)p[3]<<24);
-			if (sig == ZIP_DATA_DESC_SIG) p += 16;
+			if (p + 16 <= end)
+			{
+				u32 sig = p[0]|((u32)p[1]<<8)|((u32)p[2]<<16)|((u32)p[3]<<24);
+				if (sig == ZIP_DATA_DESC_SIG) p += 16;
+			}
 		}
 	}
+
+	#undef ZIP_LOG
 	return count;
 }
 
@@ -2478,10 +2331,15 @@ static bool _find_file_by_prefix(const char *dir, const char *prefix, char *out,
 	bool found = false;
 	while (f_readdir(&dp, &fno) == FR_OK && fno.fname[0])
 	{
-		if (strncmp(fno.fname, prefix, strlen(prefix)) == 0)
+		if (strncasecmp(fno.fname, prefix, strlen(prefix)) == 0)
 		{
+			// Must end in .zip
+			size_t len = strlen(fno.fname);
+			if (len < 4 || strncasecmp(fno.fname + len - 4, ".zip", 4) != 0)
+				continue;
+
 			// Guard against truncation: dir + '/' + fname must fit in out_size.
-			if ((int)(strlen(dir) + 1 + strlen(fno.fname) + 1) <= out_size)
+			if ((int)(strlen(dir) + 1 + len + 1) <= out_size)
 				snprintf(out, out_size, "%s/%s", dir, fno.fname);
 			else
 				continue; // Name too long for output buffer — skip.
@@ -2552,11 +2410,51 @@ static FRESULT _safe_backup_atmosphere(void)
 // ==========================================
 static lv_res_t _run_tier3_reinstall_action(lv_obj_t *btn)
 {
-	char summary_buffer[512];
-	memset(summary_buffer, 0, sizeof(summary_buffer));
+	// Create progress message box immediately so user sees activity.
+	lv_obj_t *dark_bg = lv_obj_create(lv_scr_act(), NULL);
+	lv_obj_set_style(dark_bg, &mbox_darken);
+	lv_obj_set_size(dark_bg, LV_HOR_RES, LV_VER_RES);
 
+	lv_obj_t *mbox = lv_mbox_create(dark_bg, NULL);
+	lv_mbox_set_recolor_text(mbox, true);
+	lv_mbox_set_text(mbox, "#FF8000 Step 3: Reinstall CFW#\n\nStarting...");
+	lv_obj_set_width(mbox, LV_HOR_RES / 9 * 6);
+	lv_obj_align(mbox, NULL, LV_ALIGN_CENTER, 0, 0);
+	lv_obj_set_top(mbox, true);
+
+	// Live status label inside the mbox.
+	lv_obj_t *lbl_status = lv_label_create(mbox, NULL);
+	lv_label_set_recolor(lbl_status, true);
+	lv_label_set_text(lbl_status, "#C7EA46 Mounting SD...#");
+	manual_system_maintenance(true);
+
+	char *summary_buffer = malloc(4096);
+	if (!summary_buffer) return LV_RES_OK;
+	memset(summary_buffer, 0, 4096);
 	const char *rescue_dir = "bootloader/rescue";
 	FILINFO fno;
+
+	if (sd_mount())
+	{
+		lv_label_set_text(lbl_status, "#FF0000 Failed to mount SD card!#");
+		manual_system_maintenance(true);
+		strcat(summary_buffer, "#FF0000 Failed to mount SD card!#");
+		goto _show_result;
+	}
+
+	// Open log file.
+	FIL log_fp;
+	bool log_open = (f_open(&log_fp, "bootloader/rescue/rescue_log.txt", FA_CREATE_ALWAYS | FA_WRITE) == FR_OK);
+
+	#define RESCUE_LOG(fmt, ...) \
+			do { \
+					if (log_open) { \
+							char _rl[256]; \
+							int _rn = snprintf(_rl, sizeof(_rl), fmt, ##__VA_ARGS__); \
+							UINT _rw; \
+							f_write(&log_fp, _rl, _rn, &_rw); \
+					} \
+			} while(0)
 
 	if (f_stat(rescue_dir, &fno) != FR_OK)
 	{
@@ -2568,33 +2466,51 @@ static lv_res_t _run_tier3_reinstall_action(lv_obj_t *btn)
 		goto _show_result;
 	}
 
-	// ---- Atmosphere ZIP ----
+// ---- Atmosphere ZIP ----
 	{
+		RESCUE_LOG("=== Atmosphere ZIP ===\n");
+
 		char atmo_zip_path[FF_MAX_LFN];
 		if (!_find_file_by_prefix(rescue_dir, "atmosphere", atmo_zip_path, sizeof(atmo_zip_path)))
 		{
+			RESCUE_LOG("ERROR: atmosphere*.zip not found in rescue dir\n");
 			strcat(summary_buffer, "#FFFF00 No atmosphere*.zip found in rescue folder.#\n\n");
 		}
 		else
 		{
+			RESCUE_LOG("Found: %s\n", atmo_zip_path);
+
+			lv_label_set_text(lbl_status, "#C7EA46 Loading atmosphere ZIP...#");
+			manual_system_maintenance(true);
+
 			u8 *zip_buf = NULL;
 			u32 zip_size = _sd_load_file(atmo_zip_path, &zip_buf);
+			RESCUE_LOG("ZIP load size: %lu\n", (unsigned long)zip_size);
+
 			if (!zip_buf || !zip_size)
 			{
+				RESCUE_LOG("ERROR: failed to load atmosphere ZIP\n");
 				strcat(summary_buffer, "#FF0000 Failed to load atmosphere ZIP!#\n\n");
 			}
 			else
 			{
-				// 1. Backup existing atmosphere folder before extracting.
+				lv_label_set_text(lbl_status, "#C7EA46 Backing up atmosphere/...#");
+				manual_system_maintenance(true);
+
 				FRESULT bres = _safe_backup_atmosphere();
+				RESCUE_LOG("Backup result: %d\n", (int)bres);
 				if (bres == FR_OK)
 					strcat(summary_buffer, "#00FF00 atmosphere/ backed up.#\n");
 				else
 					strcat(summary_buffer, "#FFFF00 atmosphere/ backup skipped.#\n");
 
-				// 2. Extract atmosphere/, switch/, hbmenu.nro from ZIP root to SD root.
-				// Atmosphere ZIPs lay out files at root level with no top-level folder.
-				int n = _zip_extract_folder(zip_buf, zip_size, "", "", summary_buffer);
+				lv_label_set_text(lbl_status, "#C7EA46 Extracting atmosphere ZIP...#");
+				manual_system_maintenance(true);
+
+				RESCUE_LOG("--- Extracting atmosphere ZIP entries ---\n");
+				int n = _zip_extract_folder(zip_buf, zip_size, "", "", &log_fp);
+				RESCUE_LOG("--- Extraction done: %d files ---\n", n);
+
 				if (n > 0)
 				{
 					char nbuf[64];
@@ -2604,20 +2520,34 @@ static lv_res_t _run_tier3_reinstall_action(lv_obj_t *btn)
 				else
 					strcat(summary_buffer, "#FF0000 Atmosphere extraction failed!#\n");
 
-				// 3. Also extract fusee.bin to SD root if present.
-				u8 *fusee_data = NULL;
-				u32 fusee_size = _zip_extract_entry(zip_buf, zip_size, "fusee.bin", &fusee_data, NULL);
-				if (fusee_data && fusee_size)
+				lv_label_set_text(lbl_status, "#C7EA46 Copying fusee.bin...#");
+				manual_system_maintenance(true);
+
+				char fusee_path[FF_MAX_LFN];
+				snprintf(fusee_path, sizeof(fusee_path), "%s/fusee.bin", rescue_dir);
+				FILINFO fusee_fno;
+				if (f_stat(fusee_path, &fusee_fno) == FR_OK)
 				{
-					FIL fp; UINT bw;
-					if (f_open(&fp, "fusee.bin", FA_CREATE_ALWAYS | FA_WRITE) == FR_OK)
+					RESCUE_LOG("fusee.bin found in rescue, copying...\n");
+					u8 *fusee_buf = NULL;
+					u32 fusee_size = _sd_load_file(fusee_path, &fusee_buf);
+					if (fusee_buf && fusee_size)
 					{
-						f_write(&fp, fusee_data, fusee_size, &bw);
-						f_close(&fp);
-						strcat(summary_buffer, "#00FF00 fusee.bin updated.#\n");
+						FIL fp; UINT bw;
+						if (f_open(&fp, "fusee.bin", FA_CREATE_ALWAYS | FA_WRITE) == FR_OK)
+						{
+							f_write(&fp, fusee_buf, fusee_size, &bw);
+							f_close(&fp);
+							RESCUE_LOG("fusee.bin written: %lu bytes\n", (unsigned long)fusee_size);
+							strcat(summary_buffer, "#00FF00 fusee.bin updated.#\n");
+						}
+						else
+							RESCUE_LOG("ERROR: could not open fusee.bin for write\n");
+						free(fusee_buf);
 					}
-					free(fusee_data);
 				}
+				else
+					RESCUE_LOG("fusee.bin not in rescue dir, skipping\n");
 
 				free(zip_buf);
 			}
@@ -2626,58 +2556,92 @@ static lv_res_t _run_tier3_reinstall_action(lv_obj_t *btn)
 
 	// ---- Hekate ZIP ----
 	{
+		RESCUE_LOG("=== Hekate ZIP ===\n");
+
 		char hekate_zip_path[FF_MAX_LFN];
 		if (!_find_file_by_prefix(rescue_dir, "hekate", hekate_zip_path, sizeof(hekate_zip_path)))
 		{
-			strcat(summary_buffer, "#FFFF00 No hekate*.zip found — skipping hekate update.#\n");
+			RESCUE_LOG("ERROR: hekate*.zip not found in rescue dir\n");
+			strcat(summary_buffer, "#FFFF00 No hekate*.zip found - skipping hekate update.#\n");
 		}
 		else
 		{
+			RESCUE_LOG("Found: %s\n", hekate_zip_path);
+
+			lv_label_set_text(lbl_status, "#C7EA46 Loading hekate ZIP...#");
+			manual_system_maintenance(true);
+
 			u8 *zip_buf = NULL;
 			u32 zip_size = _sd_load_file(hekate_zip_path, &zip_buf);
+			RESCUE_LOG("ZIP load size: %lu\n", (unsigned long)zip_size);
+
 			if (!zip_buf || !zip_size)
 			{
+				RESCUE_LOG("ERROR: failed to load hekate ZIP\n");
 				strcat(summary_buffer, "#FF0000 Failed to load hekate ZIP!#\n");
 			}
 			else
 			{
-				// Find hekate_ctcaer_*.bin inside the ZIP.
-				// Hekate ZIPs contain the .bin at root level.
+				lv_label_set_text(lbl_status, "#C7EA46 Extracting hekate...#");
+				manual_system_maintenance(true);
+
 				char entry_name[64] = {0};
 				u8 *bin_data = NULL;
 				u32 bin_size = _zip_extract_entry(zip_buf, zip_size, "hekate_ctcaer_", &bin_data, entry_name);
+				RESCUE_LOG("hekate bin entry: '%s' size: %lu\n", entry_name, (unsigned long)bin_size);
+
 				if (!bin_data || !bin_size)
 				{
+					RESCUE_LOG("ERROR: hekate_ctcaer_*.bin not found in ZIP\n");
 					strcat(summary_buffer, "#FF0000 hekate_ctcaer_*.bin not found in ZIP!#\n");
 				}
 				else
 				{
 					FIL fp; UINT bw; bool ok = true;
 
-					// Write to payload.bin (safe — hekate is already fully in RAM).
+					lv_label_set_text(lbl_status, "#C7EA46 Writing payload.bin...#");
+					manual_system_maintenance(true);
+
 					if (f_open(&fp, "payload.bin", FA_CREATE_ALWAYS | FA_WRITE) == FR_OK)
 					{
 						f_write(&fp, bin_data, bin_size, &bw);
 						f_close(&fp);
+						RESCUE_LOG("payload.bin written: %lu bytes\n", (unsigned long)bin_size);
 						strcat(summary_buffer, "#00FF00 payload.bin updated.#\n");
 					}
-					else { strcat(summary_buffer, "#FF0000 Could not write payload.bin!#\n"); ok = false; }
+					else
+					{
+						RESCUE_LOG("ERROR: could not write payload.bin\n");
+						strcat(summary_buffer, "#FF0000 Could not write payload.bin!#\n");
+						ok = false;
+					}
 
-					// Also write to bootloader/update.bin so hekate picks it up on next boot
-					// via its own self-update mechanism (guarantees atomic update on reboot).
 					if (ok)
 					{
+						lv_label_set_text(lbl_status, "#C7EA46 Writing bootloader/update.bin...#");
+						manual_system_maintenance(true);
+
 						if (f_open(&fp, "bootloader/update.bin", FA_CREATE_ALWAYS | FA_WRITE) == FR_OK)
 						{
 							f_write(&fp, bin_data, bin_size, &bw);
 							f_close(&fp);
+							RESCUE_LOG("bootloader/update.bin written\n");
 							strcat(summary_buffer, "#00FF00 bootloader/update.bin staged.#\n");
 						}
-						else strcat(summary_buffer, "#FFFF00 Could not write update.bin.#\n");
+						else
+						{
+							RESCUE_LOG("WARN: could not write bootloader/update.bin\n");
+							strcat(summary_buffer, "#FFFF00 Could not write update.bin.#\n");
+						}
 					}
 
-					// Also extract the bootloader/ folder from the hekate ZIP (contains nyx.bin etc).
-					int n = _zip_extract_folder(zip_buf, zip_size, "bootloader/", "", summary_buffer);
+					lv_label_set_text(lbl_status, "#C7EA46 Extracting bootloader/ support files...#");
+					manual_system_maintenance(true);
+
+					RESCUE_LOG("--- Extracting hekate bootloader/ entries ---\n");
+					int n = _zip_extract_folder(zip_buf, zip_size, "bootloader/", "", &log_fp);
+					RESCUE_LOG("--- Extraction done: %d files ---\n", n);
+
 					if (n > 0)
 					{
 						char nbuf[64];
@@ -2692,17 +2656,21 @@ static lv_res_t _run_tier3_reinstall_action(lv_obj_t *btn)
 		}
 	}
 
+	RESCUE_LOG("=== All done ===\n");
 	strcat(summary_buffer, "\n#C7EA46 Reboot to apply hekate update.#");
+	lv_label_set_text(lbl_status, "#00FF00 Done!#");
+	manual_system_maintenance(true);
 
-_show_result:;
-	lv_obj_t *dark_bg = lv_obj_create(lv_scr_act(), NULL);
-	lv_obj_set_style(dark_bg, &mbox_darken);
-	lv_obj_set_size(dark_bg, LV_HOR_RES, LV_VER_RES);
+_show_result:
+	#undef RESCUE_LOG
+	if (log_open) { f_close(&log_fp); log_open = false; }
+	sd_unmount();
 
-	static const char *mbox_btn_map[] = { "\251", "\222OK", "\251", "" };
-	lv_obj_t *mbox = lv_mbox_create(dark_bg, NULL);
-	lv_mbox_set_recolor_text(mbox, true);
+	// Update the existing mbox in place — do NOT delete dark_bg and recreate.
+	// nyx_mbox_action traverses btnm→mbox→dark_bg which must stay intact.
+	lv_obj_del(lbl_status);
 	lv_mbox_set_text(mbox, summary_buffer);
+	static const char *mbox_btn_map[] = { "\251", "\222OK", "\251", "" };
 	lv_mbox_add_btns(mbox, mbox_btn_map, nyx_mbox_action);
 	lv_obj_set_width(mbox, LV_HOR_RES / 9 * 6);
 	lv_obj_align(mbox, NULL, LV_ALIGN_CENTER, 0, 0);
@@ -2783,6 +2751,24 @@ static lv_res_t _confirm_step3(lv_obj_t *btn)
 
 	strcat(msg, "#FF8000 Step 3: Reinstall Custom Firmware#\n\n");
 
+	if (sd_mount())
+		{
+			strcat(msg, "#FF0000 Failed to mount SD card!#");
+			// show error box and return
+			lv_obj_t *dark_bg = lv_obj_create(lv_scr_act(), NULL);
+			lv_obj_set_style(dark_bg, &mbox_darken);
+			lv_obj_set_size(dark_bg, LV_HOR_RES, LV_VER_RES);
+			static const char *ok_btns[] = { "\251", "\222OK", "\251", "" };
+			lv_obj_t *mbox = lv_mbox_create(dark_bg, NULL);
+			lv_mbox_set_recolor_text(mbox, true);
+			lv_mbox_set_text(mbox, msg);
+			lv_mbox_add_btns(mbox, ok_btns, nyx_mbox_action);
+			lv_obj_set_width(mbox, LV_HOR_RES / 9 * 6);
+			lv_obj_align(mbox, NULL, LV_ALIGN_CENTER, 0, 0);
+			lv_obj_set_top(mbox, true);
+			return LV_RES_OK;
+		}
+
 	bool atmo_found = false, hekate_found = false;
 
 	// Check for atmosphere*.zip.
@@ -2792,25 +2778,18 @@ static lv_res_t _confirm_step3(lv_obj_t *btn)
 		{
 			strcat(msg, "#00FF00 [FOUND]# atmosphere*.zip\n");
 			atmo_found = true;
-
-			// Also check fusee.bin inside the zip (load just the local headers).
-			u8 *zip_buf = NULL;
-			u32 zip_size = _sd_load_file(tmp, &zip_buf);
-			if (zip_buf)
-			{
-				u8 *dummy = NULL;
-				if (_zip_extract_entry(zip_buf, zip_size, "fusee.bin", &dummy, NULL))
-				{
-					strcat(msg, "#00FF00 [FOUND]# fusee.bin inside atmosphere zip\n");
-					free(dummy);
-				}
-				else
-					strcat(msg, "#FFFF00 [MISSING]# fusee.bin inside atmosphere zip\n");
-				free(zip_buf);
-			}
 		}
 		else
 			strcat(msg, "#FF0000 [MISSING]# atmosphere*.zip\n");
+
+		// Check fusee.bin as a standalone file in rescue dir.
+		char fusee_path[FF_MAX_LFN];
+		snprintf(fusee_path, sizeof(fusee_path), "%s/fusee.bin", rescue_dir);
+		FILINFO fusee_fno;
+		if (f_stat(fusee_path, &fusee_fno) == FR_OK)
+			strcat(msg, "#00FF00 [FOUND]# fusee.bin\n");
+		else
+			strcat(msg, "#FFFF00 [MISSING]# fusee.bin (optional)\n");
 	}
 
 	// Check for hekate*.zip.
@@ -2848,6 +2827,8 @@ static lv_res_t _confirm_step3(lv_obj_t *btn)
 		lv_obj_set_top(mbox, true);
 		return LV_RES_OK;
 	}
+	
+sd_unmount();
 
 	strcat(msg, "#C7EA46 Confirm to start repair process?#");
 	_show_confirm_mbox(msg, _run_tier3_reinstall_action);
@@ -2863,68 +2844,141 @@ static lv_res_t _confirm_step3(lv_obj_t *btn)
 // ==========================================
 static lv_res_t _run_install_overlays_action(lv_obj_t *btn)
 {
-	char summary_buffer[2048];
-	memset(summary_buffer, 0, sizeof(summary_buffer));
+	lv_obj_t *dark_bg = lv_obj_create(lv_scr_act(), NULL);
+	lv_obj_set_style(dark_bg, &mbox_darken);
+	lv_obj_set_size(dark_bg, LV_HOR_RES, LV_VER_RES);
+
+	lv_obj_t *mbox = lv_mbox_create(dark_bg, NULL);
+	lv_mbox_set_recolor_text(mbox, true);
+	lv_mbox_set_text(mbox, "#FF8000 Overlay Tools Install#\n\nStarting...");
+	lv_obj_set_width(mbox, LV_HOR_RES / 9 * 6);
+	lv_obj_align(mbox, NULL, LV_ALIGN_CENTER, 0, 0);
+	lv_obj_set_top(mbox, true);
+
+	lv_obj_t *lbl_status = lv_label_create(mbox, NULL);
+	lv_label_set_recolor(lbl_status, true);
+	lv_label_set_text(lbl_status, "#C7EA46 Mounting SD...#");
+	manual_system_maintenance(true);
+
+	char *summary_buffer = malloc(2048);
+	if (!summary_buffer) return LV_RES_OK;
+	memset(summary_buffer, 0, 2048);
 	strcat(summary_buffer, "#FF8000 Overlay Tools Install#\n\n");
- 
 	const char *rescue_dir = "bootloader/rescue";
- 
-	// Packages to install in order: { zip_prefix, display_name }
+
+	// Declare ALL variables before any goto.
+	FIL log_fp;
+	bool log_open = false;
+
+	#define OVL_LOG(fmt, ...) \
+		do { \
+			if (log_open) { \
+				char _ol[256]; \
+				int _on = snprintf(_ol, sizeof(_ol), fmt, ##__VA_ARGS__); \
+				UINT _ow; \
+				f_write(&log_fp, _ol, _on, &_ow); \
+			} \
+		} while(0)
+
+	if (sd_mount())
+	{
+		lv_label_set_text(lbl_status, "#FF0000 Failed to mount SD card!#");
+		manual_system_maintenance(true);
+		strcat(summary_buffer, "#FF0000 Failed to mount SD card!#");
+		goto _ovl_show_result;
+	}
+
+	log_open = (f_open(&log_fp, "bootloader/rescue/overlay_log.txt",
+	                    FA_CREATE_ALWAYS | FA_WRITE) == FR_OK);
+
 	const char *pkgs[][2] = {
 		{ "nx-ovlloader", "nx-ovlloader" },
-		{ "ovlmenu",      "ovlmenu" },
-		{ "sys-patch",    "sys-patch" },
+		{ "ovlmenu",      "ovlmenu"      },
+		{ "sys-patch",    "sys-patch"    },
 	};
- 
+
 	for (int i = 0; i < 3; i++)
 	{
+		OVL_LOG("=== %s ===\n", pkgs[i][1]);
+
+		char status_msg[64];
+		snprintf(status_msg, sizeof(status_msg), "#C7EA46 Looking for %s...#", pkgs[i][1]);
+		lv_label_set_text(lbl_status, status_msg);
+		manual_system_maintenance(true);
+
 		char zip_path[FF_MAX_LFN];
 		if (!_find_file_by_prefix(rescue_dir, pkgs[i][0], zip_path, sizeof(zip_path)))
 		{
+			OVL_LOG("ERROR: %s*.zip not found in rescue dir\n", pkgs[i][0]);
 			char line[96];
-			snprintf(line, sizeof(line), "#FF0000 [MISSING]# %s*.zip in /bootloader/rescue/\n", pkgs[i][1]);
+			snprintf(line, sizeof(line),
+				"#FF0000 [MISSING]# %s*.zip in /bootloader/rescue/\n", pkgs[i][1]);
 			strcat(summary_buffer, line);
 			continue;
 		}
- 
+
+		OVL_LOG("Found: %s\n", zip_path);
+
+		snprintf(status_msg, sizeof(status_msg), "#C7EA46 Loading %s...#", pkgs[i][1]);
+		lv_label_set_text(lbl_status, status_msg);
+		manual_system_maintenance(true);
+
 		u8 *zip_buf = NULL;
 		u32 zip_size = _sd_load_file(zip_path, &zip_buf);
+		OVL_LOG("ZIP load size: %lu\n", (unsigned long)zip_size);
+
 		if (!zip_buf || !zip_size)
 		{
+			OVL_LOG("ERROR: failed to load %s\n", zip_path);
 			char line[96];
 			snprintf(line, sizeof(line), "#FF0000 [LOAD FAIL]# %s\n", pkgs[i][1]);
 			strcat(summary_buffer, line);
 			continue;
 		}
- 
-		int n = _zip_extract_folder(zip_buf, zip_size, "", "", summary_buffer);
+
+		snprintf(status_msg, sizeof(status_msg), "#C7EA46 Extracting %s...#", pkgs[i][1]);
+		lv_label_set_text(lbl_status, status_msg);
+		manual_system_maintenance(true);
+
+		OVL_LOG("--- Extracting %s entries ---\n", pkgs[i][1]);
+		int n = _zip_extract_folder(zip_buf, zip_size, "", "",
+		                            log_open ? &log_fp : NULL); // safe guard
+		OVL_LOG("--- Extraction done: %d files ---\n", n);
 		free(zip_buf);
- 
+
 		char line[96];
 		if (n > 0)
-			snprintf(line, sizeof(line), "#00FF00 [OK]# %s — %d files extracted.\n", pkgs[i][1], n);
+			snprintf(line, sizeof(line),
+				"#00FF00 [OK]# %s — %d files extracted.\n", pkgs[i][1], n);
 		else
-			snprintf(line, sizeof(line), "#FF0000 [FAIL]# %s extraction failed.\n", pkgs[i][1]);
+			snprintf(line, sizeof(line),
+				"#FF0000 [FAIL]# %s extraction failed.\n", pkgs[i][1]);
 		strcat(summary_buffer, line);
 	}
 
+	OVL_LOG("=== All done ===\n");
+	lv_label_set_text(lbl_status, "#00FF00 Done!#");
+	manual_system_maintenance(true);
 	strcat(summary_buffer,
 		"\n#C7EA46 If games still can't be played:#\n"
 		"1. Reboot into Atmosphere.\n"
 		"2. Open Tesla Menu with L+Dpad Down+R3 (Right Joystick).\n"
 		"3. Enable sys-patch from the overlay list.\n");
 
-	lv_obj_t *dark_bg = lv_obj_create(lv_scr_act(), NULL);
-	lv_obj_set_style(dark_bg, &mbox_darken);
-	lv_obj_set_size(dark_bg, LV_HOR_RES, LV_VER_RES);
-	static const char *mbox_btn_map[] = { "\251", "\222OK", "\251", "" };
-	lv_obj_t *mbox = lv_mbox_create(dark_bg, NULL);
-	lv_mbox_set_recolor_text(mbox, true);
+_ovl_show_result:
+	#undef OVL_LOG
+	if (log_open) { f_close(&log_fp); log_open = false; }
+	sd_unmount();
+
+	// Update the existing mbox in place — do NOT delete dark_bg and recreate.
+	lv_obj_del(lbl_status);
 	lv_mbox_set_text(mbox, summary_buffer);
+	static const char *mbox_btn_map[] = { "\251", "\222OK", "\251", "" };
 	lv_mbox_add_btns(mbox, mbox_btn_map, nyx_mbox_action);
 	lv_obj_set_width(mbox, LV_HOR_RES / 9 * 6);
 	lv_obj_align(mbox, NULL, LV_ALIGN_CENTER, 0, 0);
 	lv_obj_set_top(mbox, true);
+
 	return LV_RES_OK;
 }
 
@@ -3078,11 +3132,11 @@ static void _create_system_rescue_menu(lv_theme_t *th, lv_obj_t *parent)
 
 	// Help button — opens full scrollable instruction window.
 	lv_obj_t *btn_instruction = lv_btn_create(h1, NULL);
-	if (hekate_bg)
+	/* if (hekate_bg)
 	{
 		lv_btn_set_style(btn_instruction, LV_BTN_STYLE_REL, &btn_transp_rel);
 		lv_btn_set_style(btn_instruction, LV_BTN_STYLE_PR, &btn_transp_pr);
-	}
+	} */
 	lv_obj_t *label_btn_help = lv_label_create(btn_instruction, NULL);
 	lv_btn_set_fit(btn_instruction, true, true);
 	lv_label_set_static_text(label_btn_help, SYMBOL_LIST"  Full Instructions");
@@ -3113,11 +3167,11 @@ static void _create_system_rescue_menu(lv_theme_t *th, lv_obj_t *parent)
 
 	// Step 2 button.
 	lv_obj_t *btn_step2 = lv_btn_create(h1, NULL);
-	if (hekate_bg)
+	/* if (hekate_bg)
 	{
 		lv_btn_set_style(btn_step2, LV_BTN_STYLE_REL, &btn_transp_rel);
 		lv_btn_set_style(btn_step2, LV_BTN_STYLE_PR, &btn_transp_pr);
-	}
+	} */
 	lv_obj_t *label_btn_step2 = lv_label_create(btn_step2, NULL);
 	lv_btn_set_fit(btn_step2, true, true);
 	lv_label_set_static_text(label_btn_step2, SYMBOL_WARNING"  Step 2: Advanced System Reset");
