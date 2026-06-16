@@ -290,3 +290,10 @@ The author is not responsible for:
 * Any direct or indirect damages
 
 By using this software, you acknowledge that you understand the risks and accept full responsibility for any consequences.
+
+---
+
+### Credits
+
+* CTCaer for Hekate and Nyx
+* richgel999 for miniz
